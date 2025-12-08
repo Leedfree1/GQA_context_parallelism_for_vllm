@@ -392,6 +392,7 @@ class EngineArgs:
     nnodes: int = ParallelConfig.nnodes
     node_rank: int = ParallelConfig.node_rank
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
+    gqa_context_parallel_size: int = ParallelConfig.gqa_context_parallel_size
     prefill_context_parallel_size: int = ParallelConfig.prefill_context_parallel_size
     decode_context_parallel_size: int = ParallelConfig.decode_context_parallel_size
     dcp_kv_cache_interleave_size: int = ParallelConfig.dcp_kv_cache_interleave_size
@@ -766,6 +767,11 @@ class EngineArgs:
         parallel_group.add_argument(
             "--cp-kv-cache-interleave-size",
             **parallel_kwargs["cp_kv_cache_interleave_size"],
+        )
+        parallel_group.add_argument(
+            "--gqa-context-parallel-size",
+            "-gcp",
+            **parallel_kwargs["gqa_context_parallel_size"],
         )
         parallel_group.add_argument(
             "--prefill-context-parallel-size",
@@ -1594,6 +1600,7 @@ class EngineArgs:
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
+            gqa_context_parallel_size=self.gqa_context_parallel_size,
             prefill_context_parallel_size=self.prefill_context_parallel_size,
             data_parallel_size=self.data_parallel_size,
             data_parallel_rank=self.data_parallel_rank or 0,

@@ -113,11 +113,13 @@ class MultiprocExecutor(Executor):
         self.local_world_size = self.parallel_config.local_world_size
         tp_size = self.parallel_config.tensor_parallel_size
         pp_size = self.parallel_config.pipeline_parallel_size
+        gqa_cp_size = self.parallel_config.gqa_context_parallel_size
         pcp_size = self.parallel_config.prefill_context_parallel_size
-        assert self.world_size == tp_size * pp_size * pcp_size, (
+        assert self.world_size == tp_size * pp_size * gqa_cp_size * pcp_size, (
             f"world_size ({self.world_size}) must be equal to the "
             f"tensor_parallel_size ({tp_size}) x pipeline"
-            f"_parallel_size ({pp_size}) x prefill_context"
+            f"_parallel_size ({pp_size}) x gqa_context"
+            f"_parallel_size ({gqa_cp_size}) x prefill_context"
             f"_parallel_size ({pcp_size}). "
         )
 

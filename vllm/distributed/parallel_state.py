@@ -1109,6 +1109,14 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
+_GQA_CP: GroupCoordinator | None = None
+
+
+def get_gqa_cp_group() -> GroupCoordinator:
+    assert _GQA_CP is not None, "GQA context parallel group is not initialized"
+    return _GQA_CP
+
+
 _PCP: GroupCoordinator | None = None
 
 
@@ -1265,6 +1273,7 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    gqa_context_model_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
@@ -1294,6 +1303,7 @@ def initialize_model_parallel(
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
+    assert (prefill_context_model_parallel_size == 1 or gqa_context_model_parallel_size == 1), "PCP and GQA CP must not be >1 at the same time"
     world_size: int = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
@@ -1318,6 +1328,7 @@ def initialize_model_parallel(
         -1,
         data_parallel_size,
         pipeline_model_parallel_size,
+        gqa_context_model_parallel_size,
         prefill_context_model_parallel_size,
         tensor_model_parallel_size,
     )  # noqa
@@ -1335,6 +1346,18 @@ def initialize_model_parallel(
         backend,
         use_message_queue_broadcaster=True,
         group_name="tp",
+    )
+
+    global _GQA_CP
+    assert _GQA_CP is None, "GQA context parallel group is already initialized"
+    group_ranks = (
+        all_ranks.transpose(3, 5)
+        .reshape(-1, gqa_context_model_parallel_size)
+        .unbind(0)
+    )
+    group_ranks = [x.tolist() for x in group_ranks]
+    _GQA_CP = init_model_parallel_group(
+        group_ranks, get_world_group().local_rank, backend, group_name="gqa_cp",
     )
 
     # Build the DCP model-parallel groups.
@@ -1357,7 +1380,7 @@ def initialize_model_parallel(
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
     group_ranks = (
-        all_ranks.transpose(3, 4)
+        all_ranks.transpose(4, 5)
         .reshape(-1, prefill_context_model_parallel_size)
         .unbind(0)
     )
@@ -1370,7 +1393,7 @@ def initialize_model_parallel(
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
     group_ranks = (
-        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
+        all_ranks.transpose(2, 5).reshape(-1, pipeline_model_parallel_size).unbind(0)
     )
     group_ranks = [x.tolist() for x in group_ranks]
     _PP = init_model_parallel_group(
@@ -1379,7 +1402,7 @@ def initialize_model_parallel(
 
     global _DP
     assert _DP is None, "data parallel group is already initialized"
-    group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
+    group_ranks = all_ranks.transpose(1, 5).reshape(-1, data_parallel_size).unbind(0)
     group_ranks = [x.tolist() for x in group_ranks]
     _DP = init_model_parallel_group(
         group_ranks, get_world_group().local_rank, backend, group_name="dp"
@@ -1404,12 +1427,13 @@ def initialize_model_parallel(
 
     logger.info_once(
         "rank %s in world size %s is assigned as "
-        "DP rank %s, PP rank %s, PCP rank %s, "
+        "DP rank %s, PP rank %s, GQA-CP rank %s, PCP rank %s,"
         "TP rank %s, EP rank %s",
         rank,
         world_size,
         _DP.rank_in_group,
         _PP.rank_in_group,
+        _GQA_CP.rank_in_group,
         _PCP.rank_in_group,
         _TP.rank_in_group,
         _EP.rank_in_group,
@@ -1419,6 +1443,7 @@ def initialize_model_parallel(
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    gqa_context_model_parallel_size: int,
     prefill_context_model_parallel_size: int = 1,
     decode_context_model_parallel_size: int | None = 1,
     backend: str | None = None,
@@ -1432,6 +1457,7 @@ def ensure_model_parallel_initialized(
         initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
+            gqa_context_model_parallel_size,
             prefill_context_model_parallel_size,
             decode_context_model_parallel_size,
             backend,

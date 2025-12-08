@@ -41,6 +41,7 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
+    get_gqa_cp_group,
     get_dcp_group,
     get_pcp_group,
     get_pp_group,
@@ -305,9 +306,11 @@ class GPUModelRunner(
 
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
+        self.gqa_cp_world_size = self.parallel_config.gqa_context_parallel_size
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.pcp_world_size = self.parallel_config.prefill_context_parallel_size
         self.cp_world_size = self.dcp_world_size * self.pcp_world_size
+        self.gqa_cp_rank = 0 if self.gqa_cp_world_size <= 1 else get_gqa_cp_group().rank_in_group
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.pcp_rank = 0 if self.pcp_world_size <= 1 else get_pcp_group().rank_in_group
         self.cp_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank

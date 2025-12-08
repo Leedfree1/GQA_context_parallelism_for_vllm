@@ -75,6 +75,8 @@ class ParallelConfig:
     """Number of pipeline parallel groups."""
     tensor_parallel_size: int = 1
     """Number of tensor parallel groups."""
+    gqa_context_parallel_size: int = 1
+    """Number of GQA context parallel groups."""
     prefill_context_parallel_size: int = 1
     """Number of prefill context parallel groups."""
     data_parallel_size: int = 1
@@ -500,6 +502,7 @@ class ParallelConfig:
             self.pipeline_parallel_size
             * self.tensor_parallel_size
             * self.prefill_context_parallel_size
+            * self.gqa_context_parallel_size
         )
 
         if self.distributed_executor_backend == "external_launcher":
