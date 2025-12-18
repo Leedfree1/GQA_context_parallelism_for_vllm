@@ -366,6 +366,49 @@ class PCPManager:
             positions,
         )
 
+class GQA_CPManager:
+    """
+    Manager for GQA Context Parallelism (GQA_CP) metadata and buffers.
+
+    This manager encapsulates all GQA_CP-related buffers and logic so that the
+    ModelRunner can access them via `self.gqa_cp_manager`..
+    """
+
+    def __init__(
+        self,
+        gqa_cp_world_size: int,
+        gqa_cp_rank: int,
+        max_buffer_num_tokens: int,
+        max_num_reqs: int,
+        device: torch.device,
+        pin_memory: bool = False,
+        arange_np: np.nparray | None = None,
+    ) -> None:
+        self.gqa_cp_world_size = gqa_cp_world_size
+        self.gqa_cp_rank = gqa_cp_rank
+        self.arange_np = arange_np
+        
+        self.gqa_cp_allgather_restore_idx = CpuGpuBuffer(
+            max_buffer_num_tokens,
+            dtype=torch.int64,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        self.gqa_cp_padded_slot_mapping = torch.empty(
+            (max_buffer_num_tokens,),
+            dtype=torch.int64,
+            device=device,
+        )
+        self.num_gqa_cp_pads_cpu_tensor = torch.zeros(
+            (max_num_reqs,), device="cpu", dtype=torch.int64
+        )
+        self.num_gqa_cp_pads_cpu = self.num_gqa_cp_pads_cpu_tensor.numpy()
+        self.gqa_cp_unpad_mask_cpu_tensor = torch.zeros(
+            (max_buffer_num_tokens,),
+            device="cpu",
+            dtype=torch.bool,
+        )
+        self.gqa_cp_unpad_mask_cpu = self.gqa_cp_unpad_mask_cpu_tensor.numpy()
 
 @dataclass
 class AttentionGroup:

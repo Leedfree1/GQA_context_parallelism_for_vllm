@@ -487,6 +487,13 @@ class GPUModelRunner(
         else:
             max_buffer_num_tokens = self.max_num_tokens
 
+        if self.gqa_cp_world_size > 1:
+            max_buffer_num_tokens = (
+                self.max_num_tokens + self.max_num_reqs * 2 * self.gqa_cp_world_size
+            )
+        else:
+            max_buffer_num_tokens = self.max_num_tokens
+
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
         self.positions = self._make_buffer(max_buffer_num_tokens, dtype=torch.int64)
