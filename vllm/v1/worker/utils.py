@@ -409,6 +409,132 @@ class GQA_CPManager:
             dtype=torch.bool,
         )
         self.gqa_cp_unpad_mask_cpu = self.gqa_cp_unpad_mask_cpu_tensor.numpy()
+    
+    def _get_cumsum_and_arange(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        arange_np: np.ndarray,
+        cumsum_dtype: np.dtype | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Get the cumulative sum and batched arange of the given array.
+        # E.g., [2, 5, 3] -> ([2, 7, 10], [0, 1, 0, 1, 2, 3, 4, 0, 1, 2])
+        # Equivalent to but faster than:
+        # np.concatenate([np.arange(n) for n in num_scheduled_tokens])
+        """
+        # Step 1. [2, 5, 3] -> [2, 7, 10]
+        cu_num_tokens = np.cumsum(num_scheduled_tokens, dtype=cumsum_dtype)
+        total_num_tokens = cu_num_tokens[-1]
+        # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
+        cumsums_offsets = np.repeat(
+            cu_num_tokens - num_scheduled_tokens, num_scheduled_tokens
+        )
+        # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        arange = arange_np[:total_num_tokens] - cumsums_offsets
+
+        return cu_num_tokens, arange
+
+    def update_tokens_for_gqa_cp(
+        self,
+        tokens: np.ndarray,
+        arange_np: np.ndarray,
+        num_reqs: int,
+        reorder_batch_threshold: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+
+    assert reorder_batch_threshold is not None, (
+        "GQA-CP depends on reorder batch to split decode and prefill requests."
+    )
+    num_decode_reqs = int(np.sum(tokens[:num_reqs] <= reorder_batch_threshold))
+    num_decode_tokens = int(np.sum(tokens[:num_decode_reqs]))
+
+    W = self.gqa_cp_world_size
+    R = self.gqa_cp_rank
+
+    num_padded_scheduled_tokens = np.ceil(tokens[:num_reqs] / (2 * W)).astype(np.int32) * (2 * W)
+
+    if num_decode_reqs > 0:
+        num_padded_scheduled_tokens[:num_decode_reqs] = tokens[:num_decode_reqs].astype(np.int32) * W
+    
+    self.num_gqa_cp_pads_cpu[:num_reqs] = num_padded_scheduled_tokens - tokens[:num_reqs]
+
+    cu_padded_tokens, gqa_cp_padded_arange = self._get_cumsum_and_arange(num_padded_scheduled_tokens, arange_np)
+
+    total_padded = int(cu_padded_tokens[-1])
+
+    self.gqa_cp_unpad_mask_cpu[:total_padded] = gqa_cp_padded_arange < np.repeat(tokens[:num_reqs], num_padded_scheduled_tokens)
+
+    gqa_cp_tokens = (num_padded_scheduled_tokens // W).astype(np.int32)
+
+    gqa_cp_chunk_sizes = (gqa_cp_tokens // 2).clip(min=1)
+    if num_decode_reqs > 0:
+        gqa_cp_chunk_sizes[:num_decode_reqs] = gqa_cp_tokens[:num_decode_reqs]
+    
+    _, gqa_cp_arange = self._get_cumsum_and_arange(gqa_cp_tokens, arange_np)
+    _, gqa_cp_chunk_arange = self._get_cumsum_and_arange(gqa_cp_chunk_sizes, arange_np)
+
+    head_mask = gqa_cp_arange < np.repeat(gqa_cp_chunk_sizes, gqa_cp_tokens)
+
+    def get_current_rank_positions(
+        positions_start_loc: int | np.ndarray, rank: int
+    ) -> np.ndarray:
+        """
+        Compute flattened positions for `rank` within each request's padded buffer,
+        shifted by positions_start_loc (either scalar 0 or per-request start offsets).
+
+        - Head chunk: start at positions_start_loc + rank * chunk_size.
+        - Tail chunk: start at positions_start_loc + (2W - rank - 1) * chunk_size.
+        - Decode requests: no tail chunk; handled outside (override prefix).
+        """
+        positions = np.zeros(len(head_mask), dtype=np.int32)
+
+        head_start = positions_start_loc + rank * gqa_cp_chunk_sizes
+        tail_start = positions_start_loc + (2 * W - rank - 1) * gqa_cp_chunk_sizes
+
+        # Fill head positions
+        positions[head_mask] = gqa_cp_chunk_arange + np.repeat(
+            head_start, gqa_cp_chunk_sizes
+        )
+
+        # Fill tail positions (skip decode prefix)
+        if num_decode_tokens < len(positions):
+            positions[~head_mask] = (
+                gqa_cp_chunk_arange[num_decode_tokens:]
+                + np.repeat(tail_start, gqa_cp_chunk_sizes)[num_decode_tokens:]
+            )
+
+        return positions
+
+    # 8) Positions for current rank within each request's padded buffer (start_loc=0)
+    positions = get_current_rank_positions(0, R)
+
+    # 9) Override decode part: decode positions should be contiguous (unpadded)
+    #    because decode tokens are duplicated across ranks, not split.
+    if num_decode_reqs > 0:
+        positions[:num_decode_tokens] = self._get_cumsum_and_arange(
+            tokens[:num_decode_reqs].astype(np.int32), arange_np
+        )[1]
+
+    # 10) Build restore index for post-allgather:
+    #     Compute global start offset of each request in the padded allgather buffer
+    padded_pos_start_loc = np.roll(cu_padded_tokens, 1).astype(np.int32)
+    padded_pos_start_loc[0] = 0
+
+    # Compute positions for all ranks, concatenate, argsort to get restore permutation
+    all_positions_lst = [
+        get_current_rank_positions(padded_pos_start_loc, rank_i)
+        for rank_i in range(W)
+    ]
+    all_positions = np.concatenate(all_positions_lst, axis=0)
+    total_all = all_positions.shape[0]
+
+    self.gqa_cp_allgather_restore_idx.np[:total_all] = all_positions.argsort()
+    self.gqa_cp_allgather_restore_idx.copy_to_gpu(total_all)
+
+    return (
+        gqa_cp_tokens[:num_reqs],
+        positions,
+    )
+
 
 @dataclass
 class AttentionGroup:
