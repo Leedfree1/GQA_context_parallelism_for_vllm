@@ -388,21 +388,25 @@ class GQA_CPManager:
         self.gqa_cp_rank = gqa_cp_rank
         self.arange_np = arange_np
         
+        # allgather后恢复顺序的索引表
         self.gqa_cp_allgather_restore_idx = CpuGpuBuffer(
             max_buffer_num_tokens,
             dtype=torch.int64,
             device=device,
             pin_memory=pin_memory,
         )
+        #padded后的KV Cache slot mapping
         self.gqa_cp_padded_slot_mapping = torch.empty(
             (max_buffer_num_tokens,),
             dtype=torch.int64,
             device=device,
         )
+        #每个request补了多少pad
         self.num_gqa_cp_pads_cpu_tensor = torch.zeros(
             (max_num_reqs,), device="cpu", dtype=torch.int64
         )
         self.num_gqa_cp_pads_cpu = self.num_gqa_cp_pads_cpu_tensor.numpy()
+        #allgather buffer里哪些位置是真token
         self.gqa_cp_unpad_mask_cpu_tensor = torch.zeros(
             (max_buffer_num_tokens,),
             device="cpu",
@@ -441,88 +445,79 @@ class GQA_CPManager:
         reorder_batch_threshold: int | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
 
-    assert reorder_batch_threshold is not None, (
-        "GQA-CP depends on reorder batch to split decode and prefill requests."
-    )
-    num_decode_reqs = int(np.sum(tokens[:num_reqs] <= reorder_batch_threshold))
-    num_decode_tokens = int(np.sum(tokens[:num_decode_reqs]))
-
-    W = self.gqa_cp_world_size
-    R = self.gqa_cp_rank
-
-    num_padded_scheduled_tokens = np.ceil(tokens[:num_reqs] / (2 * W)).astype(np.int32) * (2 * W)
-
-    if num_decode_reqs > 0:
-        num_padded_scheduled_tokens[:num_decode_reqs] = tokens[:num_decode_reqs].astype(np.int32) * W
-    
-    self.num_gqa_cp_pads_cpu[:num_reqs] = num_padded_scheduled_tokens - tokens[:num_reqs]
-
-    cu_padded_tokens, gqa_cp_padded_arange = self._get_cumsum_and_arange(num_padded_scheduled_tokens, arange_np)
-
-    total_padded = int(cu_padded_tokens[-1])
-
-    self.gqa_cp_unpad_mask_cpu[:total_padded] = gqa_cp_padded_arange < np.repeat(tokens[:num_reqs], num_padded_scheduled_tokens)
-
-    gqa_cp_tokens = (num_padded_scheduled_tokens // W).astype(np.int32)
-
-    gqa_cp_chunk_sizes = (gqa_cp_tokens // 2).clip(min=1)
-    if num_decode_reqs > 0:
-        gqa_cp_chunk_sizes[:num_decode_reqs] = gqa_cp_tokens[:num_decode_reqs]
-    
-    _, gqa_cp_arange = self._get_cumsum_and_arange(gqa_cp_tokens, arange_np)
-    _, gqa_cp_chunk_arange = self._get_cumsum_and_arange(gqa_cp_chunk_sizes, arange_np)
-
-    head_mask = gqa_cp_arange < np.repeat(gqa_cp_chunk_sizes, gqa_cp_tokens)
-
-    def get_current_rank_positions(
-        positions_start_loc: int | np.ndarray, rank: int
-    ) -> np.ndarray:
-        """
-        Compute flattened positions for `rank` within each request's padded buffer,
-        shifted by positions_start_loc (either scalar 0 or per-request start offsets).
-
-        - Head chunk: start at positions_start_loc + rank * chunk_size.
-        - Tail chunk: start at positions_start_loc + (2W - rank - 1) * chunk_size.
-        - Decode requests: no tail chunk; handled outside (override prefix).
-        """
-        positions = np.zeros(len(head_mask), dtype=np.int32)
-
-        head_start = positions_start_loc + rank * gqa_cp_chunk_sizes
-        tail_start = positions_start_loc + (2 * W - rank - 1) * gqa_cp_chunk_sizes
-
-        # Fill head positions
-        positions[head_mask] = gqa_cp_chunk_arange + np.repeat(
-            head_start, gqa_cp_chunk_sizes
+        assert reorder_batch_threshold is not None, (
+            "GQA-CP depends on reorder batch to split decode and prefill requests."
         )
+        num_decode_reqs = sum(tokens <= reorder_batch_threshold)
+        num_decode_tokens = sum(tokens[:num_decode_reqs])
 
-        # Fill tail positions (skip decode prefix)
-        if num_decode_tokens < len(positions):
-            positions[~head_mask] = (
-                gqa_cp_chunk_arange[num_decode_tokens:]
-                + np.repeat(tail_start, gqa_cp_chunk_sizes)[num_decode_tokens:]
+        #decode请求词数乘gqa_cp_world_size，prefill的pad到2*pcp_world_size的整数倍
+        num_padded_scheduled_tokens = np.ceil(
+            tokens / (2 * self.gqa_cp_world_size)
+        ).astype(np.int32) * (2 * self.gqa_cp_world_size)
+
+        if num_decode_reqs > 0:
+            num_padded_scheduled_tokens[:num_decode_reqs] = (
+                tokens[:num_decode_reqs] * self.gqa_cp_world_size
             )
 
-        return positions
+        #每个请求pad的词数
+        self.num_gqa_cp_pads_cpu[:num_reqs] = num_padded_scheduled_tokens - tokens[:num_reqs]
 
-    # 8) Positions for current rank within each request's padded buffer (start_loc=0)
-    positions = get_current_rank_positions(0, R)
+        cu_padded_tokens, gqa_cp_padded_arange = self._get_cumsum_and_arange(num_padded_scheduled_tokens, arange_np)
 
-    # 9) Override decode part: decode positions should be contiguous (unpadded)
-    #    because decode tokens are duplicated across ranks, not split.
+        total_padded = int(cu_padded_tokens[-1])
+
+        self.gqa_cp_unpad_mask_cpu[:total_padded] = gqa_cp_padded_arange < np.repeat(tokens[:num_reqs], num_padded_scheduled_tokens)
+
+        #得到每个gqa_cp rank上需要处理的token数
+        gqa_cp_tokens = num_padded_scheduled_tokens // self.gqa_cp_world_size
+
+        gqa_cp_chunk_sizes = (gqa_cp_tokens // 2).clip(min=1)
+        if num_decode_reqs > 0:
+            gqa_cp_chunk_sizes[:num_decode_reqs] = gqa_cp_tokens[:num_decode_reqs]
+    
+        _, gqa_cp_arange = self._get_cumsum_and_arange(gqa_cp_tokens, arange_np)
+        _, gqa_cp_chunk_arange = self._get_cumsum_and_arange(gqa_cp_chunk_sizes, arange_np)
+
+        head_mask = gqa_cp_arange < np.repeat(gqa_cp_chunk_sizes, gqa_cp_tokens)
+
+        def get_current_rank_positions(
+            positions_start_loc: int | np.ndarray, rank: int
+        ) -> np.ndarray:
+   
+            positions = np.zeros(len(head_mask), dtype=np.int32)
+
+            head_start = positions_start_loc + rank * gqa_cp_chunk_sizes
+            tail_start = positions_start_loc + (2 * self.gqa_cp_world_size - rank - 1) * gqa_cp_chunk_sizes
+
+            # Fill head positions
+            positions[head_mask] = gqa_cp_chunk_arange + np.repeat(
+                head_start, gqa_cp_chunk_sizes
+            )
+
+            # Fill tail positions (skip decode prefix)
+            if num_decode_tokens < len(positions):
+                positions[~head_mask] = (
+                    gqa_cp_chunk_arange[num_decode_tokens:]
+                    + np.repeat(tail_start, gqa_cp_chunk_sizes)[num_decode_tokens:]
+                )
+
+            return positions
+
+    positions = get_current_rank_positions(0, self.gqa_cp_rank)
+
     if num_decode_reqs > 0:
         positions[:num_decode_tokens] = self._get_cumsum_and_arange(
-            tokens[:num_decode_reqs].astype(np.int32), arange_np
+            tokens[:num_decode_reqs], arange_np
         )[1]
 
-    # 10) Build restore index for post-allgather:
-    #     Compute global start offset of each request in the padded allgather buffer
-    padded_pos_start_loc = np.roll(cu_padded_tokens, 1).astype(np.int32)
+    padded_pos_start_loc = np.roll(cu_padded_tokens, 1)
     padded_pos_start_loc[0] = 0
 
-    # Compute positions for all ranks, concatenate, argsort to get restore permutation
     all_positions_lst = [
         get_current_rank_positions(padded_pos_start_loc, rank_i)
-        for rank_i in range(W)
+        for rank_i in range(self.gqa_cp_world_size)
     ]
     all_positions = np.concatenate(all_positions_lst, axis=0)
     total_all = all_positions.shape[0]
