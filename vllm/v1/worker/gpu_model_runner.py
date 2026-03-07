@@ -103,6 +103,7 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     create_fast_prefill_custom_backend,
     get_cp_local_seq_lens,
+    get_gqa_cp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
 )
@@ -156,7 +157,7 @@ from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
 )
-from vllm.v1.worker.utils import PCPManager, is_residual_scattered_for_sp
+from vllm.v1.worker.utils import PCPManager, GQA_CPManager, is_residual_scattered_for_sp
 
 from .utils import (
     AttentionGroup,
@@ -506,6 +507,10 @@ class GPUModelRunner(
             self.cp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
             )
+        if self.gqa_cp_world_size > 1:
+            self.gqa_cp_local_seq_lens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
         # Because inputs_embeds may be bfloat16 and we don't need a numpy
         # version of this tensor, avoid a RuntimeError by not creating a
         # numpy buffer.
@@ -537,6 +542,17 @@ class GPUModelRunner(
             self.pcp_manager = PCPManager(
                 self.pcp_world_size,
                 self.pcp_rank,
+                max_buffer_num_tokens,
+                self.max_num_reqs,
+                self.device,
+                self.pin_memory,
+            )
+        
+        # Manager for Prefill Context Parallism
+        if self.gqa_cp_world_size > 1:
+            self.gqa_cp_manager = GQA_CPManager(
+                self.gqa_cp_world_size,
+                self.gqa_cp_rank,
                 max_buffer_num_tokens,
                 self.max_num_reqs,
                 self.device,
@@ -1380,6 +1396,29 @@ class GPUModelRunner(
                 pcp_positions[:total_num_scheduled_tokens],
                 out=positions_np,
             )
+        
+        if self.gqa_cp_world_size > 1:
+            num_scheduled_tokens[:num_reqs], gqa_cp_positions = (
+                self.gqa_cp_manager.update_tokens_for_gqa_cp(
+                    num_scheduled_tokens[:num_reqs],
+                    self.arange_np,
+                    self.input_batch.num_reqs,
+                    self.reorder_batch_threshold,
+                )
+            )
+
+            # Re-update after GQA_CP split sequences.
+            total_num_scheduled_tokens = sum(num_scheduled_tokens)
+            scheduler_output.total_num_scheduled_tokens = total_num_scheduled_tokens
+
+            req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+            cu_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+            positions_np = self.positions.np[:total_num_scheduled_tokens]
+            np.add(
+                self.input_batch.num_computed_tokens_cpu[req_indices],
+                gqa_cp_positions[:total_num_scheduled_tokens],
+                out=positions_np,
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1483,6 +1522,12 @@ class GPUModelRunner(
                 + num_scheduled_tokens * self.pcp_world_size
                 - self.pcp_manager.num_pcp_pads_cpu[:num_reqs]
             ) < num_tokens_np
+        elif self.gqa_cp_world_size >1:
+            self.discard_request_mask.np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                + num_scheduled_tokens * self.gqa_cp_world_size
+                - self.gqa_cp_manager.num_gqa_cp_pads_cpu[:num_reqs]
+            ) < num_tokens_np
         else:
             self.discard_request_mask.np[:num_reqs] = (
                 self.seq_lens.np[:num_reqs] < num_tokens_np
@@ -1526,6 +1571,12 @@ class GPUModelRunner(
                     - self.pcp_manager.num_pcp_pads_cpu_tensor[:num_reqs]
                     - 1
                 )
+            elif self.gqa_cp_world_size > 1:
+                logits_indices = (
+                    torch.from_numpy(cu_num_tokens) * self.gqa_cp_world_size
+                    - self.gqa_cp_manager.num_gqa_cp_pads_cpu_tensor[:num_reqs]
+                    - 1
+                )
             else:
                 logits_indices = query_start_loc[1:] - 1
             num_draft_tokens = None
@@ -1533,6 +1584,7 @@ class GPUModelRunner(
             num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
         else:
             assert self.pcp_world_size == 1, "PCP not support spec decode now"
+            assert self.gqa_cp_world_size == 1, "GQA_CP not support spec decode now"
             # Get the number of draft tokens for each request.
             # Iterate over the dictionary rather than all requests since not all
             # requests have draft tokens.
@@ -1599,6 +1651,9 @@ class GPUModelRunner(
         assert num_tokens_padded is None or self.pcp_world_size == 1, (
             "PCP not support pad attn now"
         )
+        assert num_tokens_padded is None or self.gqa_cp_world_size == 1, (
+            "GQA_CP not support pad attn now"
+        )
 
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
@@ -1622,6 +1677,16 @@ class GPUModelRunner(
             )
             self.cp_local_seq_lens.cpu[num_reqs:].fill_(0)
             self.cp_local_seq_lens.copy_to_gpu(num_reqs_padded)
+        
+        if self.gqa_cp_world_size > 1:
+            self.gqa_cp_local_seq_lens.cpu[:num_reqs] = get_gqa_cp_local_seq_lens(
+                self.seq_lens.cpu[:num_reqs],
+                self.gqa_cp_world_size,
+                self.gqa_cp_rank,
+                self.parallel_config.gqa_cp_kv_cache_interleave_size,
+            )
+            self.gqa_cp_local_seq_lens.cpu[num_reqs:].fill_(0)
+            self.gqa_cp_local_seq_lens.copy_to_gpu(num_reqs_padded)
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -1656,6 +1721,11 @@ class GPUModelRunner(
             cp_local_seq_lens = self.cp_local_seq_lens.gpu[:num_reqs_padded]
             cp_local_seq_lens_cpu = self.cp_local_seq_lens.cpu[:num_reqs_padded]
 
+        gqa_cp_local_seq_lens, gqa_cp_local_seq_lens_cpu = None, None
+        if self.gqa_cp_world_size > 1:
+            gqa_cp_local_seq_lens = self.gqa_cp_local_seq_lens.gpu[:num_reqs_padded]
+            gqa_cp_local_seq_lens_cpu = self.gqa_cp_local_seq_lens.cpu[:num_reqs_padded]
+
         spec_decode_common_attn_metadata = None
 
         # Prepare the attention metadata for each KV cache group and make layers
@@ -1674,6 +1744,13 @@ class GPUModelRunner(
                 if self.pcp_world_size == 1
                 else num_tokens * self.pcp_world_size
                 - sum(self.pcp_manager.num_pcp_pads_cpu[:num_reqs])
+            )
+
+            maybe_gqa_cp_full_tokens = (
+                num_tokens_padded
+                if self.gqa_cp_world_size == 1
+                else num_tokens * self.gqa_cp_world_size
+                - sum(self.gqa_cp_manager.num_gqa_cp_pads_cpu[:num_reqs])
             )
 
             if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
@@ -1736,6 +1813,11 @@ class GPUModelRunner(
                     : num_tokens * self.pcp_world_size
                 ]
                 if self.pcp_world_size > 1
+                else None,
+                gqa_cp_allgather_restore_idx=self.gqa_cp_manager.gqa_cp_allgather_restore_idx.gpu[
+                    : num_tokens * self.gqa_cp_world_size
+                ]
+                if self.gqa_cp_world_size > 1
                 else None,
             )
 

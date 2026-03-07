@@ -106,6 +106,10 @@ class CommonAttentionMetadata:
     pcp_allgather_restore_idx: torch.Tensor | None = None
     """ Indices to restore the original order of KV in prefill context parallelism """
 
+    gqa_cp_local_seq_lens: torch.Tensor | None = None
+    gqa_cp_local_seq_lens_cpu: torch.Tensor | None = None
+    gqa_cp_allgather_restore_idx: torch.Tensor | None = None
+
     # TODO(lucas): remove once we have FULL-CG spec-decode support
     def unpadded(
         self, num_actual_tokens: int, num_actual_reqs: int
@@ -130,6 +134,8 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             cp_local_seq_lens=maybe_slice_reqs(self.cp_local_seq_lens),
             cp_local_seq_lens_cpu=maybe_slice_reqs(self.cp_local_seq_lens_cpu),
+            gqa_cp_local_seq_lens=maybe_slice_reqs(self.gqa_cp_local_seq_lens),
+            gqa_cp_local_seq_lens_cpu=maybe_slice_reqs(self.gqa_cp_local_seq_lens_cpu),
         )
 
 
@@ -333,6 +339,7 @@ class AttentionMetadataBuilder(abc.ABC, Generic[M]):
         if (
             self.vllm_config.parallel_config.decode_context_parallel_size > 1
             or self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+            or self.vllm_config.parallel_config.gqa_context_parallel_size > 1
         ) and not supports_cp_with_varlen:
             self.reorder_batch_threshold = 1
 
@@ -1153,6 +1160,47 @@ def get_cp_local_seq_lens(
     cp_local_seq_lens = base + remainder
     return cp_local_seq_lens.squeeze(1)
 
+def get_gqa_cp_local_seq_lens(
+    seq_lens: torch.Tensor,
+    gqa_cp_world_size: int = 1,
+    gqa_cp_rank: int | None = None,
+    gqa_cp_kv_cache_interleave_size: int = 1,
+) -> torch.Tensor:
+
+    num_requests = seq_lens.size(0)
+
+    if gqa_cp_rank is None:
+        rank_offsets = (
+            torch.arange(gqa_cp_world_size, dtype=torch.int32, device=seq_lens.device)
+            .unsqueeze(0)
+            .repeat(num_requests, 1)
+        )
+    else:
+        rank_offsets = torch.tensor(
+            [[gqa_cp_rank]], dtype=torch.int32, device=seq_lens.device
+        )
+
+    seq_lens_tiled = (
+        seq_lens.to(torch.int32).unsqueeze(-1).repeat(1, rank_offsets.shape[1])
+    )
+
+    base = (
+        seq_lens_tiled
+        // gqa_cp_kv_cache_interleave_size
+        // gqa_cp_world_size
+        * gqa_cp_kv_cache_interleave_size
+    )
+
+    remainder = seq_lens_tiled - base * gqa_cp_world_size
+    remainder = torch.clip(
+        remainder - rank_offsets * gqa_cp_kv_cache_interleave_size,
+        0,
+        gqa_cp_kv_cache_interleave_size,
+    )
+
+    gqa_cp_local_seq_lens = base + remainder
+    return gqa_cp_local_seq_lens.squeeze(1)
+
 
 def pcp_kv_allgather_and_restore(
     key: torch.Tensor,
@@ -1185,6 +1233,23 @@ def pcp_kv_allgather_and_restore(
     # Note that there are duplicate decoding tokens after allgather.
     key = torch.index_select(key_across_cp, 0, pcp_allgather_restore_idx)
     value = torch.index_select(value_across_cp, 0, pcp_allgather_restore_idx)
+    return key, value
+
+def gqa_cp_kv_allgather_and_restore(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    num_actual_tokens: int,
+    gqa_cp_allgather_restore_idx: torch.Tensor,
+    gqa_cp_group: GroupCoordinator,
+):
+    
+    key_across_gqa_cp = gqa_cp_group.all_gather(key[:num_actual_tokens].contiguous(), dim=0)
+    value_across_gqa_cp = gqa_cp_group.all_gather(
+        value[:num_actual_tokens].contiguous(), dim=0
+    )
+
+    key = torch.index_select(key_across_gqa_cp, 0, gqa_cp_allgather_restore_idx)
+    value = torch.index_select(value_across_gqa_cp, 0, gqa_cp_allgather_restore_idx)
     return key, value
 
 
@@ -1225,6 +1290,33 @@ def get_pcp_part_indices(
 
     return head_indices, tail_indices
 
+def get_gqa_cp_part_indices(
+    cu_num_tokens: torch.Tensor,
+    M: int,
+    N: int,
+    return_head=False,
+    return_tail=False,
+):
+    cu_num_tokens_np = np.asarray(cu_num_tokens)  # e.g. [0,2,4,8]
+    starts = cu_num_tokens_np[:-1]  # [0, 2, 4]
+    ends = cu_num_tokens_np[1:]  # [2, 4, 8]
+    select_len = (ends - starts) * M // N  # [1, 1, 2], M=1, N=2
+    select_num_tokens = cu_num_tokens_np[-1] * M // N
+
+    seq_ids = np.repeat(np.arange(len(select_len)), select_len)  # [0,1,2,2]
+
+    start_loc = np.concatenate([[0], np.cumsum(select_len)[:-1]])  # [0,1,2]
+    local_offsets = np.arange(select_num_tokens) - start_loc[seq_ids]  # [0,0,0,1]
+    head_indices = None
+    tail_indices = None
+    if return_head:
+        head_indices = starts[seq_ids] + local_offsets
+    if return_tail:
+        start_loc = ends - select_len
+        tail_indices = start_loc[seq_ids] + local_offsets
+
+    return head_indices, tail_indices
+
 
 def get_pcp_query_indices(cu_num_tokens: torch.Tensor):
     head_indices, tail_indices = get_pcp_part_indices(
@@ -1236,6 +1328,15 @@ def get_pcp_query_indices(cu_num_tokens: torch.Tensor):
     )
     return torch.from_numpy(head_indices), torch.from_numpy(tail_indices)
 
+def get_gqa_cp_query_indices(cu_num_tokens: torch.Tensor):
+    head_indices, tail_indices = get_gqa_cp_part_indices(
+        cu_num_tokens,
+        1,
+        2,
+        return_head=True,
+        return_tail=True,
+    )
+    return torch.from_numpy(head_indices), torch.from_numpy(tail_indices)
 
 def get_pcp_kv_indices(
     cu_num_tokens: torch.Tensor,
@@ -1252,6 +1353,25 @@ def get_pcp_kv_indices(
         cu_num_tokens,
         2 * pcp_size - pcp_rank,
         2 * pcp_size,
+        return_head=True,
+    )
+    return torch.from_numpy(kv_head_indices), torch.from_numpy(kv_tail_indices)
+
+def get_gqa_cp_kv_indices(
+    cu_num_tokens: torch.Tensor,
+    gqa_cp_rank: int,
+    gqa_cp_size: int,
+):
+    kv_head_indices, _ = get_gqa_cp_part_indices(
+        cu_num_tokens,
+        gqa_cp_rank + 1,
+        2 * gqa_cp_size,
+        return_head=True,
+    )
+    kv_tail_indices, _ = get_gqa_cp_part_indices(
+        cu_num_tokens,
+        2 * gqa_cp_size - gqa_cp_rank,
+        2 * gqa_cp_size,
         return_head=True,
     )
     return torch.from_numpy(kv_head_indices), torch.from_numpy(kv_tail_indices)

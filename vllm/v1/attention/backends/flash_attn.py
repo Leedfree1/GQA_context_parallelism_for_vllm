@@ -34,7 +34,7 @@ if is_flash_attn_varlen_func_available():
     )
 from vllm.config import VllmConfig, get_current_vllm_config, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_gqa_cp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
@@ -46,7 +46,9 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     get_cp_local_seq_lens,
+    get_gqa_cp_local_seq_lens,
     get_kv_cache_layout,
+    gqa_cp_kv_allgather_and_restore,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -207,6 +209,9 @@ class FlashAttentionMetadata:
     max_dcp_context_kv_len: int | None = None
     dcp_context_kv_lens: torch.Tensor | None = None
 
+    # For GQA CP (prefill context parallelism with all-gather)
+    gqa_cp_allgather_restore_idx: torch.Tensor | None = None
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -285,6 +290,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+
+        # GQA CP (prefill context parallelism with all-gather)
+        self.gqa_cp_world_size = self.parallel_config.gqa_context_parallel_size
+        if self.gqa_cp_world_size > 1:
+            self.gqa_cp_group = get_gqa_cp_group()
+            self.gqa_cp_rank = self.gqa_cp_group.rank_in_group
+        else:
+            self.gqa_cp_group = None
+            self.gqa_cp_rank = 0
 
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
@@ -479,6 +493,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             slot_mapping=slot_mapping,
             max_dcp_context_kv_len=max_dcp_context_kv_len,
             dcp_context_kv_lens=dcp_context_kv_lens,
+            gqa_cp_allgather_restore_idx=common_attn_metadata.gqa_cp_allgather_restore_idx,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
             scheduler_metadata=scheduler_metadata,
@@ -553,6 +568,15 @@ class FlashAttentionImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer"
             )
+
+        # GQA CP (prefill context parallelism with all-gather)
+        self.gqa_cp_world_size = 1
+        self.gqa_cp_group = None
+
+    def init_gqa_cp(self, gqa_cp_world_size: int, gqa_cp_group):
+        """Initialize GQA CP after model runner sets up the parallel groups."""
+        self.gqa_cp_world_size = gqa_cp_world_size
+        self.gqa_cp_group = gqa_cp_group
 
     def supports_quant_query_input(self) -> bool:
         return True
@@ -680,6 +704,16 @@ class FlashAttentionImpl(AttentionImpl):
                     q_descale=layer._q_scale.expand(descale_shape),
                     k_descale=layer._k_scale.expand(descale_shape),
                     v_descale=layer._v_scale.expand(descale_shape),
+                )
+                return output
+            elif self.gqa_cp_world_size > 1:
+                self._forward_with_gqa_cp(
+                    query[:num_actual_tokens],
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    get_gqa_cp_group(),
                 )
                 return output
             else:
@@ -816,6 +850,63 @@ class FlashAttentionImpl(AttentionImpl):
             query_attn_out,
             query_lse,
         )
+
+    def _forward_with_gqa_cp(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        gqa_cp_group,
+    ) -> torch.Tensor:
+        """
+        Forward pass with GQA Context Parallelism (all-gather version).
+
+        This method is used for prefill stage with GQA models when
+        gqa_context_parallel_size > 1. Each rank has a portion of the
+        input sequence, and we all-gather the KV tensors across all ranks
+        so that each rank can compute attention with the full context.
+
+        Args:
+            query: shape = [num_tokens, num_heads, head_size]
+            key: shape = [num_tokens, num_kv_heads, head_size]
+            value: shape = [num_tokens, num_kv_heads, head_size]
+            output: shape = [num_tokens, num_heads * head_size]
+            attn_metadata: attention metadata containing gqa_cp_allgather_restore_idx
+            gqa_cp_group: GQA CP group coordinator
+        """
+        cu_seqlens_q = attn_metadata.query_start_loc
+        max_seqlen_q = attn_metadata.max_query_len
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # All-gather KV tensors across all GQA CP ranks
+        key, value = gqa_cp_kv_allgather_and_restore(
+            key,
+            value,
+            num_actual_tokens,
+            attn_metadata.gqa_cp_allgather_restore_idx,
+            gqa_cp_group,
+        )
+
+        # Compute attention with the full KV
+        flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_q,
+            softmax_scale=self.scale,
+            causal=attn_metadata.causal,
+            alibi_slopes=self.alibi_slopes,
+            window_size=self.sliding_window,
+            softcap=self.logits_soft_cap,
+            fa_version=self.vllm_flash_attn_version,
+        )
+        return output
 
     def _forward_encoder_attention(
         self,
