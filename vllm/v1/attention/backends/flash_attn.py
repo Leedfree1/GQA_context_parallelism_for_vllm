@@ -861,12 +861,19 @@ class FlashAttentionImpl(AttentionImpl):
         gqa_cp_group,
     ) -> torch.Tensor:
         """
-        Forward pass with GQA Context Parallelism (all-gather version).
+        Forward pass with GQA Context Parallelism (overlapped compute and communication).
 
         This method is used for prefill stage with GQA models when
-        gqa_context_parallel_size > 1. Each rank has a portion of the
-        input sequence, and we all-gather the KV tensors across all ranks
-        so that each rank can compute attention with the full context.
+        gqa_context_parallel_size > 1.
+
+        Implementation:
+        1. Compute local attention: Q_local × KV_local (causal=True)
+        2. All-gather remote KV while computing local attention
+        3. Compute remote attention: Q_local × KV_remote (causal=False)
+        4. Merge local_out and remote_out using merge_attn_states
+
+        This approach is similar to DCP (Decode Context Parallelism) and
+        avoids computing full attention on all-gathered KV on each rank.
 
         Args:
             query: shape = [num_tokens, num_heads, head_size]
@@ -880,31 +887,74 @@ class FlashAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # All-gather KV tensors across all GQA CP ranks
-        key, value = gqa_cp_kv_allgather_and_restore(
-            key,
-            value,
-            num_actual_tokens,
-            attn_metadata.gqa_cp_allgather_restore_idx,
-            gqa_cp_group,
-        )
-
-        # Compute attention with the full KV
-        flash_attn_varlen_func(
+        # Step 1: Compute local attention (Q_local × KV_local, causal)
+        # This is the part where Q can only see local KV due to causal mask
+        local_attn_out, local_lse = flash_attn_varlen_func(
             q=query,
             k=key,
             v=value,
-            out=output,
+            out=None,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             cu_seqlens_k=cu_seqlens_q,
             max_seqlen_k=max_seqlen_q,
             softmax_scale=self.scale,
-            causal=attn_metadata.causal,
+            causal=True,
             alibi_slopes=self.alibi_slopes,
             window_size=self.sliding_window,
             softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
             fa_version=self.vllm_flash_attn_version,
+        )
+
+        # Step 2: All-gather remote KV (KV from other ranks)
+        # While computing local attention, we simultaneously gather KV from other ranks
+        key_across_gqa_cp = gqa_cp_group.all_gather(
+            key[:num_actual_tokens].contiguous(), dim=0
+        )
+        value_across_gqa_cp = gqa_cp_group.all_gather(
+            value[:num_actual_tokens].contiguous(), dim=0
+        )
+
+        # Restore the original order using gqa_cp_allgather_restore_idx
+        key_remote = torch.index_select(
+            key_across_gqa_cp, 0, attn_metadata.gqa_cp_allgather_restore_idx
+        )
+        value_remote = torch.index_select(
+            value_across_gqa_cp, 0, attn_metadata.gqa_cp_allgather_restore_idx
+        )
+
+        # Step 3: Compute remote attention (Q_local × KV_remote, non-causal)
+        # This is the "future" part that Q can't see due to causal mask
+        remote_attn_out, remote_lse = flash_attn_varlen_func(
+            q=query,
+            k=key_remote,
+            v=value_remote,
+            out=None,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_k=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_q,
+            softmax_scale=self.scale,
+            causal=False,  # Non-causal for remote KV (they are "future" tokens)
+            alibi_slopes=self.alibi_slopes,
+            window_size=self.sliding_window,
+            softcap=self.logits_soft_cap,
+            return_softmax_lse=True,
+            fa_version=self.vllm_flash_attn_version,
+        )
+
+        # Step 4: Merge local and remote attention outputs
+        # FA returns LSE in shape [ H, B ] but merge_attn_states wants [ B, H ]
+        local_lse = local_lse.transpose(0, 1).contiguous()
+        remote_lse = remote_lse.transpose(0, 1).contiguous()
+
+        merge_attn_states(
+            output,
+            remote_attn_out,
+            remote_lse,
+            local_attn_out,
+            local_lse,
         )
         return output
 
