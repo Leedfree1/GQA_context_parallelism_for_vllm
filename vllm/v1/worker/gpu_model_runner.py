@@ -1683,7 +1683,7 @@ class GPUModelRunner(
                 self.seq_lens.cpu[:num_reqs],
                 self.gqa_cp_world_size,
                 self.gqa_cp_rank,
-                self.parallel_config.gqa_cp_kv_cache_interleave_size,
+                self.parallel_config.cp_kv_cache_interleave_size,
             )
             self.gqa_cp_local_seq_lens.cpu[num_reqs:].fill_(0)
             self.gqa_cp_local_seq_lens.copy_to_gpu(num_reqs_padded)
