@@ -382,7 +382,7 @@ class GQA_CPManager:
         max_num_reqs: int,
         device: torch.device,
         pin_memory: bool = False,
-        arange_np: np.nparray | None = None,
+        arange_np: np.ndarray | None = None,
     ) -> None:
         self.gqa_cp_world_size = gqa_cp_world_size
         self.gqa_cp_rank = gqa_cp_rank
@@ -413,7 +413,7 @@ class GQA_CPManager:
             dtype=torch.bool,
         )
         self.gqa_cp_unpad_mask_cpu = self.gqa_cp_unpad_mask_cpu_tensor.numpy()
-    
+
     def _get_cumsum_and_arange(
         self,
         num_scheduled_tokens: np.ndarray,
@@ -505,30 +505,30 @@ class GQA_CPManager:
 
             return positions
 
-    positions = get_current_rank_positions(0, self.gqa_cp_rank)
+        positions = get_current_rank_positions(0, self.gqa_cp_rank)
 
-    if num_decode_reqs > 0:
-        positions[:num_decode_tokens] = self._get_cumsum_and_arange(
-            tokens[:num_decode_reqs], arange_np
-        )[1]
+        if num_decode_reqs > 0:
+            positions[:num_decode_tokens] = self._get_cumsum_and_arange(
+                tokens[:num_decode_reqs], arange_np
+            )[1]
 
-    padded_pos_start_loc = np.roll(cu_padded_tokens, 1)
-    padded_pos_start_loc[0] = 0
+        padded_pos_start_loc = np.roll(cu_padded_tokens, 1)
+        padded_pos_start_loc[0] = 0
 
-    all_positions_lst = [
-        get_current_rank_positions(padded_pos_start_loc, rank_i)
-        for rank_i in range(self.gqa_cp_world_size)
-    ]
-    all_positions = np.concatenate(all_positions_lst, axis=0)
-    total_all = all_positions.shape[0]
+        all_positions_lst = [
+            get_current_rank_positions(padded_pos_start_loc, rank_i)
+            for rank_i in range(self.gqa_cp_world_size)
+        ]
+        all_positions = np.concatenate(all_positions_lst, axis=0)
+        total_all = all_positions.shape[0]
 
-    self.gqa_cp_allgather_restore_idx.np[:total_all] = all_positions.argsort()
-    self.gqa_cp_allgather_restore_idx.copy_to_gpu(total_all)
+        self.gqa_cp_allgather_restore_idx.np[:total_all] = all_positions.argsort()
+        self.gqa_cp_allgather_restore_idx.copy_to_gpu(total_all)
 
-    return (
-        gqa_cp_tokens[:num_reqs],
-        positions,
-    )
+        return (
+            gqa_cp_tokens[:num_reqs],
+            positions,
+        )
 
 
 @dataclass
